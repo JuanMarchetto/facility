@@ -20,7 +20,7 @@ FROM docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a
 # toolchain that contains the reviewed standard-library fixes. The upstream
 # image still supplies its shell bootstrap and docker-init; every Go binary
 # that crosses into the runner is rebuilt from a checksum-pinned source commit.
-FROM golang:1.26.6-trixie@sha256:ab563819a16cfe5faff0f96a8bb598fbb0e400ab2ac751996e60abcb23b106a3 AS go-tools-base
+FROM golang:1.27rc2-trixie@sha256:2db0e0e18bbc0433b75a534f988865a860c7f91198c3953acf602f128cd23b6d AS go-tools-base
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl libseccomp-dev pkg-config \
   && rm -rf /var/lib/apt/lists/*
