@@ -49,7 +49,19 @@ export type RunSandboxState = {
   projectId?: string;
   bundle?: RunBundle;
   launchedAt?: string;
+  // Written by finishRun's terminal claim, in the same commit as the status.
   finishedAt?: string;
+  // Written once every step that follows that claim — resource reclamation,
+  // delivery, events, audit, the conversation turn — has landed. Until it is,
+  // the /result route admits a replay so an interrupted finalization resumes;
+  // see resultFinalizationPending.
+  finalizedAt?: string;
+  // The lease on that finalization: written by the claim and taken over by a
+  // replayed /result only once it is RESULT_FINALIZATION_LEASE_MS old, so two
+  // attempts never run the steps at once — the attempt a rolling restart cut
+  // the runner off from may still be running on the old process while the
+  // runner replays to the new one.
+  finalizingAt?: string;
   destroyedAt?: string;
   lastStatus?: string;
   // First reconcile tick that observed the sandbox exited/lost while the run
@@ -74,6 +86,23 @@ export const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "canceled"] as cons
 export function terminalStatus(status: string) {
   return (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
 }
+
+// A run whose terminal status finishRun committed but whose finalization it
+// never recorded as complete: the control plane went down, or a step threw,
+// between the claim and finalizedAt. Only that claim writes finishedAt — a
+// cancel or a failRun leaves it unset — so this is exactly the window a
+// replayed /result is admitted to close. A run finalized before finalizedAt
+// existed reads as pending too; resuming one re-runs guarded steps that all
+// find their work done and then records the marker.
+export function resultFinalizationPending(sandbox: RunSandboxState) {
+  return Boolean(sandbox.finishedAt) && !sandbox.finalizedAt;
+}
+
+// How long one attempt at finalization holds the run before a replay may take
+// it over. Longer than a finalization takes — a few GitHub calls at most — and
+// short against the runner's five-minute result budget, which has to cover a
+// control-plane restart plus this wait.
+export const RESULT_FINALIZATION_LEASE_MS = 60_000;
 
 export async function appendRunEvents(
   db: FacilityDb,

@@ -14,11 +14,16 @@ import {
   createGithubInstallationTokenFactory,
 } from "../github/client.js";
 import { collectGithubSecuritySweepEvidence } from "../github/security-sweep.js";
-import { finishRun, updateGithubRunProgress } from "../sandbox/orchestrator.js";
+import {
+  FinalizationInProgressError,
+  finishRun,
+  updateGithubRunProgress,
+} from "../sandbox/orchestrator.js";
 import {
   appendRunEvents,
   type RunSandboxState,
   readSandbox,
+  resultFinalizationPending,
   terminalStatus,
 } from "../sandbox/state.js";
 import type { AppConfig } from "../types.js";
@@ -101,19 +106,35 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     );
   }
 
-  async function authenticate(request: FastifyRequest) {
+  async function authenticateRunner(
+    request: FastifyRequest,
+    // Whether a terminal run is still admitted while the finalization its
+    // /result claim started has not been recorded complete. Only /result asks
+    // for it: that is the request the runner replays after a lost response, and
+    // the one finishRun knows how to resume. Every other route stays refused
+    // the moment the run is terminal — an event or a steer poll has nothing
+    // left to do for a run whose verdict is committed.
+    resumesFinalization: boolean,
+  ) {
     const { runId } = request.params as { runId: string };
     const token = bearer(request.headers.authorization);
     if (!token) throw new ApiError(401, "unauthorized", "Runner token required");
     const run = (await db.select().from(runs).where(eq(runs.id, runId)).limit(1))[0];
     if (!run) throw notFound("Run not found");
-    if (terminalStatus(run.status)) throw new ApiError(409, "run_terminal", "Run is terminal");
     const sandbox = readSandbox(run.sandbox);
+    if (
+      terminalStatus(run.status) &&
+      !(resumesFinalization && resultFinalizationPending(sandbox))
+    ) {
+      throw new ApiError(409, "run_terminal", "Run is terminal");
+    }
     if (!sandbox.runnerTokenHash || !(await verifyKey(token, sandbox.runnerTokenHash))) {
       throw new ApiError(401, "unauthorized", "Invalid runner token");
     }
     (request as RunnerRequest).runnerRun = run;
   }
+  const authenticate = (request: FastifyRequest) => authenticateRunner(request, false);
+  const authenticateResult = (request: FastifyRequest) => authenticateRunner(request, true);
 
   app.post(
     "/internal/runs/:runId/hello",
@@ -582,7 +603,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/result",
     {
       config: { public: true },
-      preHandler: authenticate,
+      preHandler: authenticateResult,
       schema: {
         params: Params,
         body: z.object({
@@ -606,7 +627,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         response: { 200: z.record(z.string(), z.unknown()) },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const run = (request as RunnerRequest).runnerRun;
       if (!run) throw notFound("Run not found");
       const body = request.body as {
@@ -625,11 +646,27 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         engineSessionId?: string;
         securityReport?: unknown;
       };
-      return (await finishRun(db, run, body, {
-        config,
-        githubClientFactory: app.githubClientFactory,
-        enqueue: app.enqueue,
-      })) as unknown as Record<string, unknown>;
+      try {
+        return (await finishRun(db, run, body, {
+          config,
+          githubClientFactory: app.githubClientFactory,
+          enqueue: app.enqueue,
+        })) as unknown as Record<string, unknown>;
+      } catch (error) {
+        if (!(error instanceof FinalizationInProgressError)) throw error;
+        // A replay while another attempt holds the finalization: the runner
+        // retries a 503 on this endpoint and honors the wait, and the code is
+        // exposed so the reply says what is being waited on rather than
+        // masking it as an internal error.
+        reply.header("retry-after", String(Math.ceil(error.retryAfterMs / 1000)));
+        throw new ApiError(
+          503,
+          "finalization_in_progress",
+          "Run finalization is in progress; retry after the lease expires",
+          undefined,
+          true,
+        );
+      }
     },
   );
 
