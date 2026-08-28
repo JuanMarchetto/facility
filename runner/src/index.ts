@@ -170,10 +170,20 @@ export const ENDPOINT_RETRY_POLICIES = {
   // Same last-writer-wins upload as the transcript, and losing the archive costs
   // the next run its warm session, so the replay is worth taking.
   "session-state": { replaySafe: true },
-  // A replay that lands after a committed first post answers 409 run_terminal,
-  // which postResult absorbs, so the ambiguous case is already handled and losing
-  // the outcome entirely is the worse failure. The run's only record of its
-  // outcome also gets a longer budget than ordinary calls.
+  // The handler records the base commit once, under an is-null guard, and
+  // answers an exact replay with the recorded value: a second delivery of the
+  // same SHA lands on the same row, and a different SHA is refused rather than
+  // rewriting the provenance already bound to the run.
+  workspace: { replaySafe: true },
+  // A replay that lands after a committed first post is answered one of two
+  // ways, and postResult handles both: 200 if the control plane went down
+  // between committing the verdict and finishing the work that follows it — the
+  // route admits that replay and resumes the finalization from where it
+  // stopped, each step guarded so nothing already done is done again — or 409
+  // run_terminal once that work is complete, which postResult absorbs. Either
+  // way the ambiguous case is covered, and losing the outcome entirely is the
+  // worse failure. The run's only record of its outcome also gets a longer
+  // budget than ordinary calls.
   result: { budgetMs: RESULT_RETRY_BUDGET_MS, replaySafe: true },
   // Every call mints a fresh GitHub installation token with contents:write and
   // writes an audit row, with no idempotency guard. A replay after a lost response
@@ -2152,16 +2162,19 @@ export async function postResult(
     });
   } catch (postError) {
     if (isRunTerminalConflict(postError)) {
-      // A terminal verdict is already recorded for this run, and it is most
-      // often this very post: /result is on the replaySafe policy, so an attempt
-      // whose response was lost after the handler committed is replayed by the
-      // retry loop and answered 409 — the recorded verdict is then identical to
-      // the one below, not a different one. It can also be another party's, in
-      // which case it differs: /v1/runs/:runId/cancel records "canceled", and
-      // failRun records "failed" when the control plane concludes the sandbox is
-      // gone. Either way the run is terminal, so /events is refused from here on
-      // too and the container log is the only place left to record what this
-      // attempt carried.
+      // A terminal verdict is already recorded for this run and fully finalized,
+      // and it is most often this very post: /result is on the replaySafe
+      // policy, so an attempt whose response was lost after the handler
+      // committed is replayed by the retry loop. The route admits that replay
+      // for as long as the work after the verdict is unfinished — it resumes
+      // that work and answers 200, which never reaches this branch — and
+      // answers 409 only once it is complete, so the recorded verdict here is
+      // identical to the one below, not a different one. It can also be another
+      // party's, in which case it differs: /v1/runs/:runId/cancel records
+      // "canceled", and failRun records "failed" when the control plane
+      // concludes the sandbox is gone. Either way the run is terminal, so
+      // /events is refused from here on too and the container log is the only
+      // place left to record what this attempt carried.
       process.stderr.write(runTerminalDiscardLog(status, git));
       return;
     }

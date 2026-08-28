@@ -1001,6 +1001,7 @@ describe("runner per-endpoint replay policy", () => {
       steer: { replaySafe: true },
       transcript: { replaySafe: true },
       "session-state": { replaySafe: true },
+      workspace: { replaySafe: true },
       result: { budgetMs: 5 * 60_000, replaySafe: true },
       "push-token": { replaySafe: false },
       events: { replaySafe: false },
