@@ -1364,7 +1364,9 @@ describe("discarded result logging", () => {
     // Truncation is visible, so an operator reading the line knows the message
     // continues rather than believing Git said only this much.
     expect(line).toContain("...[truncated]");
-    // Still one greppable line whose later fields survive the bound.
+    // Still one greppable line: push_error is the last field, so nothing follows
+    // it to survive — what the bound must leave intact is the fields ahead of it
+    // and the single trailing newline.
     expect(line.endsWith("\n")).toBe(true);
     expect(line.trimEnd()).not.toContain("\n");
     expect(line).toContain("branch=-");
@@ -1887,6 +1889,58 @@ describe("Claude resume controls", () => {
     expect(again.handled).toEqual(["msg_9"]);
     expect(again.error).toBeUndefined();
     expect(events).toHaveLength(1);
+  });
+
+  it("records a retired steer on stderr even when the event never gets out", async () => {
+    const emitted: string[] = [];
+    const handlers = {
+      appendSteer: async () => {
+        throw new Error(`no space left on device ${"x".repeat(60_000)}`);
+      },
+      emit: async () => {
+        // What the control plane answers once the run is terminal: authenticate
+        // refuses every /internal/runs/:runId route with 409 run_terminal, and
+        // applyControlMessages drops that rejection.
+        emitted.push("refused");
+        throw new Error("run_terminal");
+      },
+      interrupt: async () => undefined,
+    };
+    const messages = [{ id: "msg_12", kind: "steer", body: "tighten the diff" }];
+    const failures = new Map<string, number>();
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    let records: string[] = [];
+    let handled: string[] = [];
+    try {
+      for (let attempt = 0; attempt < CONTROL_MESSAGE_MAX_ATTEMPTS + 2; attempt += 1) {
+        handled = (await applyControlMessages(messages, handlers, failures)).handled;
+      }
+    } finally {
+      // Read before restoring: mockRestore clears the recorded calls with it.
+      records = stderr.mock.calls
+        .map(([chunk]) => String(chunk))
+        .filter((line) => line.startsWith("steer_undeliverable"));
+      stderr.mockRestore();
+    }
+
+    // The operator's instruction was thrown away and its id acked anyway, so the
+    // route marks the row delivered. Every attempt at the event that would have
+    // said so was refused, which leaves the container log as the only record.
+    expect(handled).toEqual(["msg_12"]);
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(records).toHaveLength(1);
+    const [record = ""] = records;
+    expect(record).toContain("id=msg_12");
+    expect(record).toContain(`attempts=${CONTROL_MESSAGE_MAX_ATTEMPTS}`);
+    expect(record).toContain("error=no space left on device xxx");
+    // Bounded like the discarded-result record: the error is whatever the
+    // durable action threw, so it may not turn the container log into a wall of
+    // text, and the truncation is visible rather than silent.
+    expect(record).toContain("...[truncated]");
+    expect(record.length).toBeLessThan(1_000);
+    expect(record.endsWith("\n")).toBe(true);
+    expect(record.trimEnd()).not.toContain("\n");
   });
 
   it("never gives up on an interrupt, and still reports it once", async () => {

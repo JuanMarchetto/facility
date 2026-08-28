@@ -35,6 +35,7 @@ import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { verifyStoredReceipts } from "../src/receipt-integrity.js";
+import { STEER_ACK_MAX, STEER_BATCH } from "../src/routes/internal.js";
 import { AwsSandboxDriver } from "../src/sandbox/aws.js";
 import { sandboxCachePartition, sandboxNamespace } from "../src/sandbox/cache.js";
 import { DockerSandboxDriver } from "../src/sandbox/docker.js";
@@ -1125,7 +1126,10 @@ describe("sandbox api", async () => {
     const message = await insertSteerMessage(run.id, "interrupt", "human_interrupt");
     const poll = {
       method: "GET" as const,
-      url: `/internal/runs/${run.id}/steer`,
+      // The ack parameter present and empty: a runner that speaks this protocol
+      // sends it on every poll, its first included, and empty whenever it has
+      // nothing to name.
+      url: `/internal/runs/${run.id}/steer?ack=`,
       headers: { authorization: `Bearer ${token}` },
     };
 
@@ -1152,7 +1156,11 @@ describe("sandbox api", async () => {
       method: "GET",
       // Two acked ids straddling an unacked one: the runner handled the first
       // and the third and could not apply the second. Only an exact-id ack can
-      // express that, and the runner's poison-message bound produces it.
+      // express that, and the runner produces it by applying the rest of a batch
+      // rather than stopping at the message that failed, and leaving that
+      // message's id out of the ack. Its poison-message bound is what ends the
+      // straddle: past enough attempts a steer that keeps failing joins the ack
+      // anyway, so the route stops serving it.
       url: `/internal/runs/${run.id}/steer?ack=${handled.id},${alsoHandled.id}`,
       headers: { authorization: `Bearer ${token}` },
     });
@@ -1213,12 +1221,12 @@ describe("sandbox api", async () => {
     });
     expect(ack.statusCode).toBe(200);
 
-    // The runner polls again carrying no ack — the shape of the poll that
-    // follows an ack whose response arrived. The recorded delivery is the only
-    // thing keeping the already-applied interrupt from being applied twice.
+    // The runner polls again with the ack parameter empty — the shape of the poll
+    // that follows an ack whose response arrived. The recorded delivery is the
+    // only thing keeping the already-applied interrupt from being applied twice.
     const restarted = await app.inject({
       method: "GET",
-      url: `/internal/runs/${run.id}/steer`,
+      url: `/internal/runs/${run.id}/steer?ack=`,
       headers: { authorization: `Bearer ${token}` },
     });
 
@@ -1229,20 +1237,22 @@ describe("sandbox api", async () => {
     const token = "frt_steer_bad_ack";
     const run = await insertRunnerRun(token, "running");
     const pending = await insertSteerMessage(run.id, "interrupt", "human_interrupt");
-    // The shapes a buggy or hostile caller reaches for: a prefix with no id
-    // ('evt_z' also sorts above every real id under this database's en_US.utf8
-    // collation), an empty entry, a non-id, a real id with a suffix, a real id
-    // upper-cased, a valid id with one bad entry beside it, and a list longer
-    // than a served batch can be. The route takes only ids it could have issued,
-    // so each list is refused whole and nothing is marked delivered.
+    // The shapes a buggy or hostile caller reaches for. All but the last name
+    // something this route could not have issued — a prefix with no id ('evt_z'
+    // also sorts above every real id under this database's en_US.utf8
+    // collation), an empty entry beside a real one, a non-id, a real id with a
+    // suffix, a real id upper-cased, and a valid id with one bad entry beside
+    // it. The last names nothing but ids this route could have issued and is
+    // refused for its length alone. Either way the list is refused whole and
+    // nothing is marked delivered.
     const malformed = [
       "evt_z",
-      "",
+      `,${pending.id}`,
       "not-an-id",
       `${pending.id}x`,
       pending.id.toUpperCase(),
       `${pending.id},evt_z`,
-      Array.from({ length: 33 }, () => pending.id).join(","),
+      Array.from({ length: STEER_ACK_MAX + 1 }, () => pending.id).join(","),
     ];
     for (const ack of malformed) {
       const rejected = await app.inject({
@@ -1256,7 +1266,7 @@ describe("sandbox api", async () => {
 
     const response = await app.inject({
       method: "GET",
-      url: `/internal/runs/${run.id}/steer`,
+      url: `/internal/runs/${run.id}/steer?ack=`,
       headers: { authorization: `Bearer ${token}` },
     });
     expect(steerIds(response)).toEqual([pending.id]);
@@ -1319,7 +1329,10 @@ describe("sandbox api", async () => {
     // steer_messages carries its own org_id and no constraint ties it to the
     // org of the run it names, so a row like this one is reachable through a
     // mis-scoped writer. Both statements on this route stay inside the polling
-    // run's org, like every other runner-scoped query in this file.
+    // run's org, which is not true of every runner-scoped query on these
+    // internal routes: /hello claims the run's credentials on the run id and
+    // status alone, and two of the three installation lookups match on
+    // installation id alone.
     const foreignOrg = (
       await db
         .insert(steerMessages)
@@ -1370,10 +1383,15 @@ describe("sandbox api", async () => {
     expect(response.statusCode).toBe(200);
     expect(steerIds(response)).toEqual([next.id]);
     // A runner started before the ack existed polls with this cursor, applies
-    // whatever comes back and starts the next poll with no delay of its own. The
-    // delivery this response records is the only thing that retires the row for
-    // it: without it the same body is served again on the very next poll, and on
-    // every poll after that for the rest of the run.
+    // whatever comes back and starts the next poll with no delay of its own,
+    // having no ack to retire anything with. What this test replays is one poll
+    // object — the same cursor twice — so the delivery recorded here is what
+    // keeps the same body out of the second response. That runner does not
+    // repeat a cursor: it moves it to each message it applies. What the delivery
+    // buys it is the row the cursor alone would hand it twice, since a batch is
+    // ordered by createdAt while the cursor filters on id, and ids come from
+    // per-process counters — so a row of that same batch can sort above the
+    // cursor the runner ends up with and be applied a second time.
     expect(await steerDeliveries(run.id)).toEqual([
       { id: seen.id, deliveredAt: null },
       { id: next.id, deliveredAt: expect.any(Date) },
@@ -1445,6 +1463,118 @@ describe("sandbox api", async () => {
       { id: handled.id, deliveredAt: expect.any(Date) },
       { id: served.id, deliveredAt: null },
     ]);
+  });
+
+  it("records delivery from the select for a poll carrying no ack parameter at all", async () => {
+    const token = "frt_steer_legacy_first_poll";
+    const run = await insertRunnerRun(token, "running");
+    const first = await insertSteerMessage(run.id, "steer", "tighten the diff");
+
+    // A runner that predates the ack opens its loop with a bare poll: it has no
+    // cursor until a batch gives it one, so its first poll carries no parameter
+    // of any kind. The presence of the ack parameter is the only thing that
+    // tells that runner apart from one that speaks this protocol, since the
+    // latter sends the parameter empty rather than omitting it.
+    const response = await app.inject({
+      method: "GET",
+      url: `/internal/runs/${run.id}/steer`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(steerIds(response)).toEqual([first.id]);
+    // That runner applies what comes back and never names an id, so this
+    // response is the only thing that can retire the row. Left pending, the row
+    // is served again on a later poll whenever its id sorts above the cursor
+    // that runner ends up with — it takes the cursor from the last message of
+    // the batch in this route's order, which is createdAt first, while the
+    // compatibility select filters on id — and the steer body is appended a
+    // second time.
+    expect(await steerDeliveries(run.id)).toEqual([
+      { id: first.id, deliveredAt: expect.any(Date) },
+    ]);
+  });
+
+  it("leaves another org's message unserved on a poll carrying no ack parameter", async () => {
+    const token = "frt_steer_legacy_cross_org";
+    const run = await insertRunnerRun(token, "running");
+    const otherOrgId = newId("org");
+    await db.insert(orgs).values({
+      id: otherOrgId,
+      name: "Steer Legacy Other Org",
+      slug: `steer-legacy-${Date.now()}`,
+    });
+    // Inserted first, so it is the oldest pending row on this run and the batch
+    // would open with it. steer_messages carries its own org_id and no
+    // constraint ties it to the org of the run it names.
+    const foreignOrg = (
+      await db
+        .insert(steerMessages)
+        .values({
+          id: newId("evt"),
+          orgId: otherOrgId,
+          runId: run.id,
+          kind: "interrupt",
+          body: "human_interrupt",
+        })
+        .returning()
+    )[0];
+    if (!foreignOrg) throw new Error("failed to insert cross-org steer message");
+    const pending = await insertSteerMessage(run.id, "steer", "keep going");
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/internal/runs/${run.id}/steer`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    // The compatibility path serves and marks in one exchange, so the org scope
+    // on its select is what keeps the foreign row out of both: never handed to
+    // this run, and therefore never among the ids its response retires.
+    expect(steerIds(response)).toEqual([pending.id]);
+    expect(await steerDeliveries(run.id)).toEqual([
+      { id: foreignOrg.id, deliveredAt: null },
+      { id: pending.id, deliveredAt: expect.any(Date) },
+    ]);
+  });
+
+  it("acknowledges a whole served batch in one request", async () => {
+    const token = "frt_steer_full_batch";
+    const run = await insertRunnerRun(token, "running");
+    const inserted = [];
+    // One past the batch limit, so the batch comes back full and the poll that
+    // acknowledges it still has a pending row to answer with at once.
+    for (let i = 0; i <= STEER_BATCH; i += 1) {
+      inserted.push(await insertSteerMessage(run.id, "steer", `tighten the diff ${i}`));
+    }
+    const batch = inserted.slice(0, STEER_BATCH);
+
+    const served = await app.inject({
+      method: "GET",
+      url: `/internal/runs/${run.id}/steer?ack=`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(served.statusCode).toBe(200);
+    expect(steerIds(served)).toEqual(batch.map((message) => message.id));
+
+    // The whole batch acknowledged in one request, which is what a runner does
+    // after applying it. Refused, this ack would take every id in it down
+    // together and the runner would re-send the same list on every later poll.
+    const acked = await app.inject({
+      method: "GET",
+      url: `/internal/runs/${run.id}/steer?ack=${batch.map((message) => message.id).join(",")}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(acked.statusCode).toBe(200);
+    expect(await steerDeliveries(run.id)).toEqual(
+      inserted.map((message) => ({
+        id: message.id,
+        deliveredAt: batch.includes(message) ? expect.any(Date) : null,
+      })),
+    );
   });
 
   it("aws driver fails loudly as not_configured when env is missing", async () => {
@@ -2452,8 +2582,10 @@ describe("sandbox api", async () => {
       prefix: `lossrace_${Date.now()}`,
       last4: "0000",
       hash: "loss-race-hash",
-      // Far-future expiry, so a null revokedAt proves nothing revoked the key
-      // rather than proving it merely outlived its own lifetime.
+      // Nothing but an explicit revoke writes revokedAt, so the null asserted
+      // below holds whatever this date says. What a far-future expiry buys is a
+      // key the surviving run can still use: authentication turns away an
+      // expired key as firmly as a revoked one.
       expiresAt: new Date(Date.now() + 3_600_000),
     });
     // driver.status() is a provider round trip, so an overlapping tick can see

@@ -79,6 +79,12 @@ const TRANSIENT_RETRY_MAX_DELAY_MS = 10_000;
 // longer budget than ordinary calls before abandoning the control plane.
 const RESULT_RETRY_BUDGET_MS = 5 * 60_000;
 const STEER_POLL_RETRY_DELAY_MS = 5_000;
+// How many consecutive failed polls before the channel's outage is recorded to
+// the container log, which is the only place left for it: the degraded event
+// reports a window that ended, so an outage that never ends is reported nowhere.
+// At the fixed retry delay above this is a minute of a silent control channel
+// before the record, long enough that an ordinary restart passes without one.
+const STEER_POLL_FAILURES_BEFORE_REPORT = 12;
 // Pacing for the one poll that has nothing of its own to wait on: a batch the
 // steer route answers again at once because nothing in it reached the ack. The
 // delay doubles from the base and stops at the max, so a message left pending for
@@ -139,6 +145,12 @@ const AMBIGUOUS_NETWORK_CODES = new Set([
 // wrap. What this table cannot see is a call that reaches the control plane
 // without that transport at all, which is why the derivation test in the
 // runner's retry suite also refuses any bare request beyond the loop's own.
+// Every entry states a decision. replaySafe is required here, unlike on
+// TransientRetryOptions where a caller may leave the pacing fields out: an entry
+// added without reading its handler must not be indistinguishable from a
+// classified one, so it fails to compile instead. The entries are readonly so
+// the table cannot be edited through a reference the resolver handed out.
+type EndpointRetryPolicy = Readonly<TransientRetryOptions> & { readonly replaySafe: boolean };
 export const ENDPOINT_RETRY_POLICIES = {
   // The handshake is one-shot by design: it claims the provisioning→running
   // transition and stamps virtualKeyRevealedAt, so a replay after a lost response
@@ -174,14 +186,16 @@ export const ENDPOINT_RETRY_POLICIES = {
   // wrong receipt rather than a cosmetic artifact — this needs server-side
   // idempotency before it can opt in.
   events: { replaySafe: false },
-} as const satisfies Record<string, TransientRetryOptions>;
+} as const satisfies Record<string, EndpointRetryPolicy>;
 // An unclassified endpoint fails on an ambiguous loss instead of replaying it.
 // Every way of getting here is safe in that direction: a new route whose handler
 // nobody has read yet, or a renamed one whose entry no longer matches, degrades
 // to a lost response failing the run rather than to a duplicated effect.
-export const ENDPOINT_RETRY_POLICY_DEFAULT: TransientRetryOptions = { replaySafe: false };
+export const ENDPOINT_RETRY_POLICY_DEFAULT = {
+  replaySafe: false,
+} as const satisfies EndpointRetryPolicy;
 
-export function endpointRetryPolicy(path: string): TransientRetryOptions {
+export function endpointRetryPolicy(path: string): EndpointRetryPolicy {
   // Query and fragment are per-call arguments (the steer poll's acks), not part
   // of the endpoint's identity. hasOwn keeps an inherited property of the table's
   // prototype from being read as a classification.
@@ -752,9 +766,14 @@ async function runEngine(bundle: RunBundle, restoredSessionState: boolean) {
 // id matches its ACK_ID shape, so each id is encoded individually: the separator
 // has to stay literal between ids while a comma or an `&` inside one is escaped
 // rather than read as another id or another query parameter.
+//
+// The parameter itself is always emitted, empty value included, because its
+// presence is what identifies this protocol to the route: a request carrying no
+// ack parameter at all is served the semantics that predate it, which mark the
+// rows they serve. Emitting it only when there is something to name would put
+// this runner's own first poll — which has handled nothing yet — on that path.
 export function steerPollPath(runId: string, ack: string[]) {
-  const query = ack.length > 0 ? `?ack=${ack.map(encodeURIComponent).join(",")}` : "";
-  return `/internal/runs/${runId}/steer${query}`;
+  return `/internal/runs/${runId}/steer?ack=${ack.map(encodeURIComponent).join(",")}`;
 }
 
 // The shape the steer route's ack accepts, which is exactly what newId("evt")
@@ -870,15 +889,17 @@ export async function steeringPollLoop({
       // long-polls while nothing is pending and answers the instant something
       // is, so a batch no id of which reached the ack is served again on the
       // next poll immediately: without this the loop would poll as fast as the
-      // control plane can answer, for the rest of the run. Reachable two ways —
-      // an interrupt whose kill keeps throwing, which is deliberately never
-      // retired, and a message whose id the ack cannot carry. The counter resets
-      // as soon as any id newly reaches the ack, so the poll that follows a batch
-      // which made progress is not delayed. The sleep is not free, though: it
-      // runs before the next poll, so anything created while the loop is stalled
-      // — an interrupt included — waits out the rest of it before the poll that
-      // would fetch it even starts. The window doubles from
-      // STEER_STALLED_POLL_BASE_DELAY_MS and stops at
+      // control plane can answer, for the rest of the run. Reachable three ways
+      // — a steer whose durable action is still failing and has not yet reached
+      // CONTROL_MESSAGE_MAX_ATTEMPTS, which is the full-disk case that bound is
+      // written for; an interrupt whose kill keeps throwing, which is
+      // deliberately never retired; and a message whose id the ack cannot carry.
+      // The counter resets as soon as any id newly reaches the ack, so the poll
+      // that follows a batch which made progress is not delayed. The sleep is
+      // not free, though: it runs before the next poll, so anything created
+      // while the loop is stalled — an interrupt included — waits out the rest
+      // of it before the poll that would fetch it even starts. The window
+      // doubles from STEER_STALLED_POLL_BASE_DELAY_MS and stops at
       // STEER_STALLED_POLL_MAX_DELAY_MS, and each delay is drawn from the top
       // half of its window, so that wait is at most 15 seconds, and 7.5 to 15
       // seconds from the fifth consecutive stalled poll on. That is what not
@@ -903,6 +924,14 @@ export async function steeringPollLoop({
       // rest of a possibly hours-long run. Only a terminal run ends it.
       if (isRunTerminalConflict(error) || isStopped()) return;
       failedPolls += 1;
+      // Once per outage, on the poll that reaches the bound: the count keeps
+      // climbing past it and only a poll that comes back resets it, so a channel
+      // that stays down costs one line rather than one per poll. The event above
+      // is left as it was — it reports the window after the fact, which is all it
+      // can do, and says nothing at all if no poll ever resolves again.
+      if (failedPolls === STEER_POLL_FAILURES_BEFORE_REPORT) {
+        process.stderr.write(steerPollUnreachableLog(failedPolls, error));
+      }
       await sleep(STEER_POLL_RETRY_DELAY_MS);
     }
   }
@@ -1600,10 +1629,11 @@ type ControlHandlers = {
 
 export async function handleControlMessage(message: ControlMessage, handlers: ControlHandlers) {
   // The durable action — the kill, the steer-file append — must land before,
-  // and regardless of, any ack the event transport may fail to carry
-  // mid-outage; a lost ack must not surface as a failed message. The steer
-  // event is observability; the id this message is acked under on the next poll
-  // is what records delivery.
+  // and regardless of, the steer event reporting it, which the event transport
+  // may fail to carry mid-outage; a lost event must not surface as a failed
+  // message. That event is observability only. What records delivery is the ack
+  // parameter the next poll names this id in, which is a separate channel and
+  // the one the rest of this file means by "ack".
   if (message.kind === "interrupt") {
     await handlers.interrupt();
     await handlers
@@ -1639,9 +1669,12 @@ export async function applyControlMessages(
   messages: ControlMessage[],
   handlers: ControlHandlers,
   // Consecutive failures per message id, owned by the caller so the count
-  // survives the redeliveries that produce it. A handled id is dropped from it;
-  // a failing one keeps counting up, which is what makes the diagnostic below
-  // fire on one attempt only.
+  // survives the redeliveries that produce it. Only an id whose action landed is
+  // dropped from it: a failing one keeps counting up, and a retired one keeps
+  // the count it was retired on for the rest of the run. That is what makes the
+  // diagnostic below fire on one attempt only — it fires where the count equals
+  // the bound, so dropping a retired id would restart the next redelivery at
+  // zero and walk it up to that same attempt again.
   failures: Map<string, number> = new Map(),
   maxAttempts = CONTROL_MESSAGE_MAX_ATTEMPTS,
 ): Promise<{ handled: string[]; error?: unknown }> {
@@ -1660,8 +1693,11 @@ export async function applyControlMessages(
     try {
       await handleControlMessage(message, handlers);
       failures.delete(message.id);
-      // Only an id whose durable action landed goes into the ack, so anything
-      // else is served again on the next poll.
+      // The durable action landed, so the id goes into the ack and the route
+      // retires the row. It is not the only way in — a retired steer is acked
+      // below, and an already-retired copy above, neither of them having applied
+      // anything — but every other outcome stays out and is served again on the
+      // next poll.
       handled.push(message.id);
     } catch (caught) {
       error = caught;
@@ -1670,6 +1706,11 @@ export async function applyControlMessages(
       // Exactly at the bound, never past it: an interrupt keeps counting up from
       // here, and one diagnostic per undeliverable message is the whole point.
       if (attempts === maxAttempts) {
+        // Written whatever the event channel does with the report beside it.
+        // That channel is refused outright once the run is terminal and the
+        // rejection is dropped below, and an operator's instruction being
+        // discarded is not something this may fail to record.
+        process.stderr.write(steerUndeliverableLog(message.id, attempts, caught));
         await handlers
           .emit([
             {
@@ -1684,7 +1725,9 @@ export async function applyControlMessages(
           ])
           .catch(() => undefined);
       }
-      // A retired message is acked so the server stops serving it. An interrupt
+      // A retired message is acked so the server stops serving it: the second
+      // of the two places an id reaches the ack with nothing applied, the
+      // re-ack of an already-retired copy above being the first. An interrupt
       // stays out of the ack whatever its count, which is what keeps it pending
       // and retried for the life of the run.
       if (retirable && attempts >= maxAttempts) handled.push(message.id);
@@ -1776,8 +1819,7 @@ export async function awaitCommandStreams(
     const code = await exit;
     // Wait for both stream readers to finish draining before returning, so no
     // output line is emitted AFTER the caller records the run's result (a late
-    // event would be dropped as post-terminal). Previously these loops were
-    // fire-and-forget and could lose or reorder trailing output.
+    // event would be dropped as post-terminal).
     await Promise.all(drains);
     return code;
   } finally {
@@ -2249,36 +2291,85 @@ export function deliveryStatusEvent(
 // turn this record into a wall of agent-influenced text in the container log.
 const DISCARD_LOG_FIELD_MAX_CHARS = 512;
 
+// One field of a container-log record, shared by the three built below. A
+// missing or non-string value renders as "-" so the record keeps its field count
+// and never prints the literal "undefined" or "null" — four of postResult's five
+// call sites pass no git object at all. Whitespace collapses because these
+// values are captured error text that can span lines, and a record split across
+// lines defeats a single-line operator grep.
+function discardLogField(value: unknown, secrets: Iterable<string>) {
+  if (typeof value !== "string" || !value.trim()) return "-";
+  // Redact before bounding, never after: a secret straddling the cut would
+  // leave the prefix the bound kept, and no later redaction pass can match a
+  // token it only has half of. The line-level pass in each caller stays as it
+  // was.
+  const collapsed = redactSecrets(value.replace(/\s+/g, " ").trim(), secrets);
+  // The marker carries no space, so the record keeps parsing as one field per
+  // token, and it is in the output rather than truncating silently — an
+  // operator reading the line can tell the message continued.
+  return collapsed.length > DISCARD_LOG_FIELD_MAX_CHARS
+    ? `${collapsed.slice(0, DISCARD_LOG_FIELD_MAX_CHARS)}...[truncated]`
+    : collapsed;
+}
+
 export function runTerminalDiscardLog(
   status: "succeeded" | "failed" | "canceled",
   git: Record<string, unknown> | undefined,
   secrets: Iterable<string> = secretsToRedact,
 ): string {
-  // A missing or non-string coordinate renders as "-" so the record keeps its
-  // field count and never prints the literal "undefined" or "null" — four of
-  // postResult's five call sites pass no git object at all. Whitespace collapses
-  // because a push error is a captured Git stderr message that can span lines,
-  // and a record split across lines defeats a single-line operator grep.
-  const coordinate = (value: unknown) => {
-    if (typeof value !== "string" || !value.trim()) return "-";
-    // Redact before bounding, never after: a secret straddling the cut would
-    // leave the prefix the bound kept, and no later redaction pass can match a
-    // token it only has half of. The line-level pass below stays as it was.
-    const collapsed = redactSecrets(value.replace(/\s+/g, " ").trim(), secrets);
-    // The marker carries no space, so the record keeps parsing as one field per
-    // token, and it is in the output rather than truncating silently — an
-    // operator reading the line can tell the message continued.
-    return collapsed.length > DISCARD_LOG_FIELD_MAX_CHARS
-      ? `${collapsed.slice(0, DISCARD_LOG_FIELD_MAX_CHARS)}...[truncated]`
-      : collapsed;
-  };
+  const coordinate = (value: unknown) => discardLogField(value, secrets);
   const line = [
     "result_discarded_run_terminal",
     `attempted_status=${status}`,
+    // Not a coordinate: this one is a boolean, so a git object that never
+    // arrived renders changed=false, which reads the same as a delivery that
+    // genuinely changed nothing.
     `changed=${git?.changed === true}`,
     `branch=${coordinate(git?.branch)}`,
     `head_sha=${coordinate(git?.headSha)}`,
     `push_error=${coordinate(git?.pushError)}`,
+  ].join(" ");
+  return `${redactSecrets(line, secrets)}\n`;
+}
+
+// The record of a steer this runner gave up on. Its steer_undeliverable event
+// goes out over /events, which the control plane refuses with 409 run_terminal
+// once the run is terminal — authenticate refuses every /internal/runs/:runId
+// route that way — and applyControlMessages drops that rejection. The id is
+// acknowledged whatever happens to the event, so the route marks the row
+// delivered either way; without this line an operator's instruction could be
+// discarded with nothing recording it anywhere. Bounded and redacted like the
+// discarded result above: the error is whatever the durable action threw, of no
+// bounded length, and it lands in the same container log.
+function steerUndeliverableLog(
+  id: string,
+  attempts: number,
+  error: unknown,
+  secrets: Iterable<string> = secretsToRedact,
+): string {
+  const line = [
+    "steer_undeliverable",
+    `id=${discardLogField(id, secrets)}`,
+    `attempts=${attempts}`,
+    `error=${discardLogField(errorMessage(error), secrets)}`,
+  ].join(" ");
+  return `${redactSecrets(line, secrets)}\n`;
+}
+
+// The record of a steer channel that stopped answering. steer_poll_degraded is
+// emitted from steeringPollLoop's success path, after a poll resolves, so a
+// channel whose polls all fail from here on emits nothing at all — a refused ack
+// is re-sent unchanged by every later poll, which makes a permanent 4xx exactly
+// that case. Bounded and redacted like the records above for the same reason.
+function steerPollUnreachableLog(
+  failures: number,
+  error: unknown,
+  secrets: Iterable<string> = secretsToRedact,
+): string {
+  const line = [
+    "steer_poll_unreachable",
+    `failures=${failures}`,
+    `error=${discardLogField(errorMessage(error), secrets)}`,
   ].join(" ");
   return `${redactSecrets(line, secrets)}\n`;
 }

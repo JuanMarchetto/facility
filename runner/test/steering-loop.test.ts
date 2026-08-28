@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ACKABLE_STEER_ID, ackableSteerIds, steeringPollLoop } from "../src/index.js";
 import type { RunEvent } from "../src/types.js";
 
@@ -156,6 +156,42 @@ describe("steering poll pacing", () => {
     });
     expect(run.steers).toEqual(["tighten the diff"]);
   });
+
+  it("records a steer channel that never comes back, once", async () => {
+    // A refused ack is re-sent unchanged on every later poll, so a 4xx the route
+    // answers to it never clears. Nothing in the loop reports that: the degraded
+    // event is emitted on the success path, after a poll resolves, so a channel
+    // that never resolves again emits nothing at all.
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const run = harness({
+      polls: 20,
+      poll: (_ack, poll) => {
+        throw new Error(`steer ack refused ${poll}`);
+      },
+    });
+    let records: string[] = [];
+    try {
+      await run.done;
+    } finally {
+      // Read before restoring: mockRestore clears the recorded calls with it.
+      records = stderr.mock.calls
+        .map(([chunk]) => String(chunk))
+        .filter((line) => line.startsWith("steer_poll_unreachable"));
+      stderr.mockRestore();
+    }
+
+    // One record per outage, not one per poll: 20 polls failed and the operator
+    // gets a single line naming how many and what the last one said.
+    expect(records).toHaveLength(1);
+    expect(records[0]).toContain("failures=12");
+    expect(records[0]).toContain("error=steer ack refused 12");
+    // The event path is untouched — it still has nothing to say while no poll
+    // resolves, which is the hole this record covers.
+    expect(run.events).toEqual([]);
+    // Nor is the retry pacing touched: every failed poll still waits out the
+    // fixed retry delay.
+    expect(new Set(run.sleeps)).toEqual(new Set([5_000]));
+  });
 });
 
 describe("steer ack id filtering", () => {
@@ -163,8 +199,9 @@ describe("steer ack id filtering", () => {
     expect(
       ackableSteerIds([
         ackable("ab"),
-        // Too short, wrong prefix, uppercase hex, and an id carrying the
-        // separator the runner encodes ids with.
+        // Too short, wrong prefix, uppercase hex, an id carrying the comma the
+        // runner separates ids with, and one carrying the ampersand that would
+        // otherwise open a second query parameter.
         "evt_",
         `run_${"a".repeat(32)}`,
         `evt_${"A".repeat(32)}`,
@@ -219,8 +256,11 @@ describe("steer ack id filtering", () => {
     ).toEqual([
       { type: "artifact_error", data: { kind: "steer_ack_id_unacceptable", id: "steer_legacy" } },
     ]);
-    // Paced, not spun: the two polls that ended with nothing acked backed off,
-    // and the poll that acked the good message did not.
+    // Paced, not spun, and the backoff belongs to the streak rather than to the
+    // run: the first two polls acked nothing and backed off, the poll that acked
+    // the good message was not delayed at all, and the fourth — served the
+    // unackable row again — starts the backoff over at the base delay, because
+    // that ack reset the counter.
     expect(run.sleeps).toEqual([500, 1_000, 500]);
   });
 

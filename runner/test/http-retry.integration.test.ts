@@ -529,7 +529,9 @@ describe("runner control-plane outage recovery", () => {
     const server = createServer((request, response) => {
       attempts += 1;
       const polled = new URL(request.url ?? "/", "http://127.0.0.1");
-      for (const id of polled.searchParams.get("ack")?.split(",") ?? []) delivered.add(id);
+      // Every poll carries the parameter; only a non-empty value names ids.
+      const acked = polled.searchParams.get("ack");
+      for (const id of acked ? acked.split(",") : []) delivered.add(id);
       response.setHeader("content-type", "application/json");
       if (attempts === 1) {
         response.setHeader("content-length", "100");
@@ -849,7 +851,10 @@ describe("runner steer poll acknowledgement", () => {
   it("names every acked id in the query and encodes each one on its own", () => {
     const first = ackId("a");
     const second = ackId("b");
-    expect(steerPollPath("run_test", [])).toBe("/internal/runs/run_test/steer");
+    // The parameter is emitted even with nothing to acknowledge: its presence is
+    // what tells this protocol apart from the one that predates the ack, and a
+    // runner's first poll has nothing to name.
+    expect(steerPollPath("run_test", [])).toBe("/internal/runs/run_test/steer?ack=");
     expect(steerPollPath("run_test", [first, second])).toBe(
       `/internal/runs/run_test/steer?ack=${first},${second}`,
     );
@@ -871,10 +876,14 @@ describe("runner steer poll acknowledgement", () => {
     const served: string[][] = [];
     const pending = new Set([unwritable, applied]);
     const server = createServer((request, response) => {
-      // The server's own parse: comma-separated ids, each refused unless it is
-      // shaped like a message id, and delivery recorded from the ack alone.
+      // A stand-in for the route, not a copy of it: it splits the ack on commas
+      // and refuses anything not shaped like a message id, which is the part the
+      // path construction has to satisfy. It leaves out the route's ack cap, its
+      // run and org scope, its batch limit, and the protocol split that reads
+      // whether the parameter is there at all.
       const query = new URL(request.url ?? "/", "http://127.0.0.1").searchParams;
-      const ack = query.get("ack")?.split(",") ?? [];
+      const acked = query.get("ack");
+      const ack = acked ? acked.split(",") : [];
       if (!ack.every((id) => ACK_ID.test(id))) {
         response.statusCode = 400;
         response.end("{}");
@@ -927,10 +936,8 @@ describe("runner steer poll acknowledgement", () => {
     expect(polled).toEqual([[], [applied], [unwritable]]);
     expect(served).toEqual([[unwritable, applied], [unwritable], []]);
     expect(steers).toEqual(["tighten the diff", "onto a full disk"]);
-    // Nothing else acknowledged either message, and the run's whole ack traffic
-    // stays inside the 32-id cap the server enforces on one poll.
+    // Nothing else acknowledged either message.
     expect(polled.flat().sort()).toEqual([applied, unwritable].sort());
-    for (const ids of polled) expect(ids.length).toBeLessThanOrEqual(32);
   });
 });
 
