@@ -60,8 +60,15 @@ export type RunSandboxState = {
   // replayed /result only once it is RESULT_FINALIZATION_LEASE_MS old, so two
   // attempts never run the steps at once — the attempt a rolling restart cut
   // the runner off from may still be running on the old process while the
-  // runner replays to the new one.
+  // runner replays to the new one. A live attempt renews it for as long as it
+  // works (between steps and on a timer inside long ones), so expiry means the
+  // holder is dead or stalled, not merely slow.
   finalizingAt?: string;
+  // Which attempt holds that lease: minted by the claim, replaced by a
+  // takeover. Renewal compare-and-sets on it, so a stalled attempt that was
+  // taken over discovers the loss atomically at its next step and aborts
+  // instead of running beside — and duplicating the effects of — the winner.
+  finalizingToken?: string;
   destroyedAt?: string;
   lastStatus?: string;
   // First reconcile tick that observed the sandbox exited/lost while the run
@@ -98,11 +105,17 @@ export function resultFinalizationPending(sandbox: RunSandboxState) {
   return Boolean(sandbox.finishedAt) && !sandbox.finalizedAt;
 }
 
-// How long one attempt at finalization holds the run before a replay may take
-// it over. Longer than a finalization takes — a few GitHub calls at most — and
-// short against the runner's five-minute result budget, which has to cover a
-// control-plane restart plus this wait.
+// How long one attempt at finalization holds the run without renewing before a
+// replay may take it over. Not a bound on how long a finalization may take —
+// a security sync can spend minutes on GitHub — but on how long a live attempt
+// goes between renewals, which happen at every step boundary and on a
+// RESULT_FINALIZATION_RENEW_MS timer inside a step. Short against the runner's
+// five-minute result budget, which has to cover a control-plane restart plus
+// this wait.
 export const RESULT_FINALIZATION_LEASE_MS = 60_000;
+// How often an attempt renews mid-step. A third of the lease, so a takeover
+// needs several missed renewals, not one late timer tick.
+export const RESULT_FINALIZATION_RENEW_MS = RESULT_FINALIZATION_LEASE_MS / 3;
 
 export async function appendRunEvents(
   db: FacilityDb,

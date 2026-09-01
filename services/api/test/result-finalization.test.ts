@@ -413,6 +413,122 @@ describe("result finalization after an interrupted terminal claim", async () => 
     });
   });
 
+  // A first attempt paused inside the named step, and the promise that lets
+  // the test resume it. The two lease tests below both hold an attempt open
+  // past the lease; they differ in whether its heartbeat is running.
+  function attemptHeldAt(
+    step: FinalizationStep,
+    run: (typeof runs)["$inferSelect"],
+    renewMs: number,
+  ) {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let blocked!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      blocked = resolve;
+    });
+    const attempt = finishRun(db, run, body, {
+      finalizationLeaseRenewMs: renewMs,
+      afterFinalizationStep: async (at) => {
+        if (at !== step) return;
+        blocked();
+        await held;
+      },
+    });
+    return { attempt, reached, release };
+  }
+
+  async function storedFinalizingAt(runId: string) {
+    const [stored] = await db
+      .select({ sandbox: runs.sandbox })
+      .from(runs)
+      .where(eq(runs.id, runId));
+    return Date.parse(readSandbox(stored?.sandbox).finalizingAt ?? "");
+  }
+
+  it("renews the lease under a live attempt that outlasts it, so a replay waits instead of taking over", async () => {
+    // Finalization can legitimately run longer than the lease — a security
+    // sync can spend minutes on GitHub — so an attempt renews for as long as
+    // it works. An attempt alive past the lease therefore still looks held to
+    // the runner's replay, which waits on a 503 rather than running the steps
+    // beside it and duplicating their effects.
+    const { run, token, conversationId, virtualKeyId } = await conversationRun("renewal");
+    const first = attemptHeldAt("keys", run, 25);
+    await first.reached;
+    // Age the lease past expiry under the working attempt — standing in for
+    // the wait the test cannot spend — and watch the heartbeat re-freshen it.
+    await expireFinalizationLease(run.id);
+    let renewed = false;
+    for (let i = 0; i < 500 && !renewed; i++) {
+      const at = await storedFinalizingAt(run.id);
+      renewed = Number.isFinite(at) && Date.now() - at < RESULT_FINALIZATION_LEASE_MS;
+      if (!renewed) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(renewed).toBe(true);
+    const replay = await postResult(run.id, token);
+    expect(replay.statusCode).toBe(503);
+    expect(replay.json().error.code).toBe("finalization_in_progress");
+    // No takeover: nothing past the step the attempt is paused in has run.
+    expect(await finalizationState(run.id, conversationId, virtualKeyId)).toMatchObject({
+      keyRevoked: true,
+      resultEvents: 0,
+      finishedAudits: 0,
+      replies: 0,
+    });
+    first.release();
+    await expect(first.attempt).resolves.toMatchObject({ id: run.id, status: "succeeded" });
+    const finalized = await finalizationState(run.id, conversationId, virtualKeyId);
+    expect(finalized).toMatchObject({
+      status: "succeeded",
+      keyRevoked: true,
+      resultEvents: 1,
+      finishedAudits: 1,
+      replies: 1,
+      conversationStatus: "idle",
+    });
+    expect(finalized.sandbox.finalizedAt).toEqual(expect.any(String));
+    const again = await postResult(run.id, token);
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error.code).toBe("run_terminal");
+  });
+
+  it("aborts a stalled attempt a replay superseded before it repeats an effect", async () => {
+    // The other half of the fence: an attempt that really did stop renewing —
+    // its process stalled — loses the lease to the replay. When it wakes it
+    // must discover that at its next step boundary and abort, not run the
+    // remaining steps beside the winner: the per-step guards are idempotency
+    // guards, and two concurrent attempts could each see an effect missing and
+    // create it twice.
+    const { run, token, conversationId, virtualKeyId } = await conversationRun("superseded");
+    // A renewal cadence far past the test stands in for the stall.
+    const first = attemptHeldAt("keys", run, 600_000);
+    await first.reached;
+    await expireFinalizationLease(run.id);
+    // The replay takes the expired lease over and finalizes everything.
+    const replay = await postResult(run.id, token);
+    expect(replay.statusCode).toBe(200);
+    const won = await finalizationState(run.id, conversationId, virtualKeyId);
+    expect(won).toMatchObject({
+      status: "succeeded",
+      keyRevoked: true,
+      resultEvents: 1,
+      finishedAudits: 1,
+      replies: 1,
+      conversationStatus: "idle",
+    });
+    expect(won.sandbox.finalizedAt).toEqual(expect.any(String));
+    // The stalled attempt wakes into a lease it no longer holds: the renewal
+    // compare-and-set at its next boundary fails against the winner's token,
+    // and it surfaces the same 503 a waiting replay gets — whose retry the
+    // finished run then refuses as run_terminal — with every effect counted
+    // exactly once.
+    first.release();
+    await expect(first.attempt).rejects.toThrow("Run finalization is in progress");
+    expect(await finalizationState(run.id, conversationId, virtualKeyId)).toEqual(won);
+  });
+
   it("refuses a result for a run another path made terminal", async () => {
     // A failRun or a cancel commits its terminal status without finishRun's
     // claim, so the run carries no finishedAt: there is no finalization of a

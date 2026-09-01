@@ -97,6 +97,7 @@ import { sandboxDriver } from "./driver.js";
 import {
   appendRunEvents,
   RESULT_FINALIZATION_LEASE_MS,
+  RESULT_FINALIZATION_RENEW_MS,
   type RunBundle,
   type RunnerEngine,
   type RunSandboxState,
@@ -120,6 +121,12 @@ type FinishRunDeps = {
    * interrupt at any depth and replay the result.
    */
   afterFinalizationStep?: (step: FinalizationStep) => Promise<void> | void;
+  /**
+   * Test seam for the mid-step lease renewal cadence: shortened to observe a
+   * renewal without waiting a real tick, or stretched past the test to simulate
+   * an attempt whose process stalled and stopped renewing.
+   */
+  finalizationLeaseRenewMs?: number;
 };
 // The steps finishRun runs once the terminal status is committed, in order.
 // Each is guarded against its own repetition, which is what lets a replayed
@@ -607,6 +614,7 @@ export async function finishRun(
             ...sandbox,
             finishedAt: new Date().toISOString(),
             finalizingAt: new Date().toISOString(),
+            finalizingToken: crypto.randomUUID(),
           },
           updatedAt: new Date(),
         })
@@ -684,17 +692,21 @@ async function resumeRunFinalization(
   input: FinishRunInput,
   deps?: FinishRunDeps,
 ) {
-  // Take the lease over atomically, and only from an attempt that has had
-  // longer than the lease to finish: the guards below keep sequential attempts
-  // from repeating a step, not concurrent ones. The row this returns carries
-  // whatever the earlier attempt recorded — its destroyedAt, its downgraded
-  // status — which is what the rest of this reads.
+  // Take the lease over atomically, and only from an attempt that has stopped
+  // renewing for a whole lease — a live one renews at every step and on a
+  // timer inside long ones, so an expired lease means its holder is dead or
+  // stalled: the guards below keep sequential attempts from repeating a step,
+  // not concurrent ones. The takeover mints its own token, which is what a
+  // stalled holder's next renewal fails against, forcing it to abort. The row
+  // this returns carries whatever the earlier attempt recorded — its
+  // destroyedAt, its downgraded status — which is what the rest of this reads.
   const now = new Date();
   const staleBefore = new Date(now.getTime() - RESULT_FINALIZATION_LEASE_MS).toISOString();
+  const takeover = { finalizingAt: now.toISOString(), finalizingToken: crypto.randomUUID() };
   const [run] = await db
     .update(runs)
     .set({
-      sandbox: sql`${runs.sandbox} || ${JSON.stringify({ finalizingAt: now.toISOString() })}::jsonb`,
+      sandbox: sql`${runs.sandbox} || ${JSON.stringify(takeover)}::jsonb`,
       updatedAt: now,
     })
     .where(
@@ -802,16 +814,82 @@ async function resumeRunFinalization(
 // which would leave a crash between the two to repeat it. A step re-entered on
 // a resumed attempt therefore finds its work done and moves on, and the marker
 // written last admits no further replay.
+//
+// Those guards are idempotency guards, not mutual exclusion: two attempts
+// running the steps at once could each observe an effect missing and create it
+// twice. Mutual exclusion is the lease's job, and this wrapper is what keeps it
+// held for the whole finalization rather than for its first sixty seconds: the
+// attempt renews its finalizingAt at every step boundary and on a timer inside
+// long steps (a security sync can spend minutes on GitHub), each renewal a
+// compare-and-set on the finalizingToken its claim or takeover minted. A live
+// attempt therefore never looks expired to a replay — the replay waits on a 503
+// instead of taking over — and an attempt that did stall past the lease finds
+// the winner's token at its next renewal and aborts before its next effect.
 async function finalizeRun(
   db: ReturnType<typeof createDb>["db"],
   claimed: RunRow,
   context: FinalizationContext,
   deps?: FinishRunDeps,
 ) {
+  const leaseToken = readSandbox(claimed.sandbox).finalizingToken;
+  // A row claimed before tokens existed (a rolling restart's old process wrote
+  // it) can only be renewed, never lost — the pre-token behaviour. Every claim
+  // and takeover in this code mints one.
+  const holdsLease = leaseToken
+    ? sql`${runs.sandbox}->>'finalizingToken' = ${leaseToken}`
+    : sql`${runs.sandbox}->>'finalizingToken' is null`;
+  const renewLease = async () => {
+    const now = new Date();
+    const renewed = await db
+      .update(runs)
+      .set({
+        sandbox: sql`${runs.sandbox} || ${JSON.stringify({ finalizingAt: now.toISOString() })}::jsonb`,
+        updatedAt: now,
+      })
+      .where(and(eq(runs.orgId, claimed.orgId), eq(runs.id, claimed.id), holdsLease))
+      .returning({ id: runs.id });
+    return renewed.length > 0;
+  };
+  // A tick that fails transiently is absorbed — the step-boundary renewal is
+  // the authoritative check, and it throws on the same unreachable database. A
+  // tick that finds the token gone stops renewing; the boundary aborts the
+  // attempt.
+  const heartbeat = setInterval(() => {
+    void renewLease()
+      .then((held) => {
+        if (!held) clearInterval(heartbeat);
+      })
+      .catch(() => undefined);
+  }, deps?.finalizationLeaseRenewMs ?? RESULT_FINALIZATION_RENEW_MS);
+  heartbeat.unref?.();
+  try {
+    return await finalizeRunSteps(db, claimed, context, { renewLease, holdsLease }, deps);
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+type FinalizationLease = {
+  renewLease: () => Promise<boolean>;
+  holdsLease: SQL;
+};
+
+async function finalizeRunSteps(
+  db: ReturnType<typeof createDb>["db"],
+  claimed: RunRow,
+  context: FinalizationContext,
+  lease: FinalizationLease,
+  deps?: FinishRunDeps,
+) {
   const run = claimed;
   const { input, aggregate, receiptBaseSha, securityReport } = context;
   let { status, error, receipt } = context;
   const step = async (name: FinalizationStep) => {
+    // The renewal doubles as the fence: an attempt another one superseded
+    // fails the compare-and-set here and stops before its next effect, and the
+    // runner's retry of its 503 lands on the winner's outcome.
+    if (!(await lease.renewLease()))
+      throw new FinalizationInProgressError(RESULT_FINALIZATION_LEASE_MS);
     await deps?.afterFinalizationStep?.(name);
   };
   const sandbox = readSandbox(run.sandbox);
@@ -866,7 +944,14 @@ async function finalizeRun(
     !(await hasRunEvent(db, run.orgId, run.id, "security_findings"))
   ) {
     try {
-      const sync = await publishSecurityFindings(db, run, securityReport, deps);
+      // The one step whose length scales with the run's output — up to twenty
+      // findings, several GitHub calls each — so ownership is re-proved (and
+      // with it the lease renewed) before every finding, not only at the step
+      // boundaries around it.
+      const sync = await publishSecurityFindings(db, run, securityReport, deps, async () => {
+        if (!(await lease.renewLease()))
+          throw new FinalizationInProgressError(RESULT_FINALIZATION_LEASE_MS);
+      });
       await appendRunEvents(db, run.orgId, run.id, [
         {
           type: "security_findings",
@@ -883,6 +968,9 @@ async function finalizeRun(
         },
       ]);
     } catch (syncError) {
+      // Losing the lease is not a sync failure: the winner owns the run's
+      // outcome now, and this attempt's job is to stop, not to downgrade it.
+      if (syncError instanceof FinalizationInProgressError) throw syncError;
       status = "failed";
       error = `security_issue_sync_failed:${errorMessage(syncError)}`;
       receipt = await canonicalRunReceipt(
@@ -893,10 +981,13 @@ async function finalizeRun(
         status,
         receiptBaseSha,
       );
+      // Fenced on the lease: a superseded attempt must not rewrite the status
+      // the winning one is finalizing. The boundary below aborts it anyway;
+      // this keeps the row untouched in the meantime.
       await db
         .update(runs)
         .set({ status, receipt, error, updatedAt: new Date() })
-        .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id)));
+        .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id), lease.holdsLease));
     }
   }
   await step("security_findings");
@@ -977,13 +1068,19 @@ async function finalizeRun(
   await step("conversation");
   // Merged rather than assigned, so a destroyedAt the reconciler wrote in the
   // meantime survives. From here a replayed /result is refused as run_terminal.
-  await db
+  // Fenced on the lease: only the attempt that owns the finalization may
+  // declare it complete — one superseded mid-flight reports the 503 the
+  // runner retries into the winner's outcome, never a success over work the
+  // winner is still doing.
+  const [finalized] = await db
     .update(runs)
     .set({
       sandbox: sql`${runs.sandbox} || ${JSON.stringify({ finalizedAt: new Date().toISOString() })}::jsonb`,
       updatedAt: new Date(),
     })
-    .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id)));
+    .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id), lease.holdsLease))
+    .returning({ id: runs.id });
+  if (!finalized) throw new FinalizationInProgressError(RESULT_FINALIZATION_LEASE_MS);
   return { ...claimed, status, receipt, error };
 }
 
@@ -2027,6 +2124,7 @@ async function publishSecurityFindings(
   run: RunRow,
   report: SecurityReport,
   deps?: FinishRunDeps,
+  assertOwnership?: () => Promise<void>,
 ) {
   const repo = await repoForGithubRun(db, run);
   if (!repo?.installationId) throw new Error("run_repo_missing_installation");
@@ -2054,7 +2152,7 @@ async function publishSecurityFindings(
     repo: repo.name,
     defaultBranch: repo.defaultBranch,
   });
-  const result = await syncSecurityFindings(client, report, { runId: run.id });
+  const result = await syncSecurityFindings(client, report, { runId: run.id }, assertOwnership);
   await insertAuditEvent(db, {
     orgId: run.orgId,
     projectId: run.projectId,
